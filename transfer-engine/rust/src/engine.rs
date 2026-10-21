@@ -254,7 +254,7 @@ impl Engine {
                 verbs::ibv_close_device(context);
                 return Err(Error::Io);
             }
-            let cq = verbs::ibv_create_cq(context, 1024, ptr::null_mut(), None, 0);
+            let cq = verbs::ibv_create_cq(context, 1024, ptr::null_mut(), ptr::null_mut(), 0);
             if cq.is_null() {
                 verbs::ibv_dealloc_pd(pd);
                 verbs::ibv_close_device(context);
@@ -430,7 +430,7 @@ impl Engine {
                 | verbs::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
                 | verbs::ibv_access_flags::IBV_ACCESS_REMOTE_READ
                 | verbs::ibv_access_flags::IBV_ACCESS_REMOTE_ATOMIC)
-                .0 as i32;
+                .0;
             let flags = (verbs::ibv_qp_attr_mask::IBV_QP_STATE
                 | verbs::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
                 | verbs::ibv_qp_attr_mask::IBV_QP_PORT
@@ -675,8 +675,8 @@ impl Engine {
 
     /// Release the batch's task records. Return Busy while any task is Pending.
     pub fn free_batch(&mut self, batch: BatchId) -> Result<(), Error> {
-        let batch = self.batches.get(&batch).ok_or(Error::Invalid)?;
-        if batch
+        let record = self.batches.get(&batch).ok_or(Error::Invalid)?;
+        if record
             .statuses
             .iter()
             .any(|status| *status == TransferStatus::Pending)
