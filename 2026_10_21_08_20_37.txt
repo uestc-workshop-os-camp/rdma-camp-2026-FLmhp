@@ -1,0 +1,10 @@
+Language: rust
+Lab0: 0/1
+Lab1: 0/1
+Lab2: 0/1
+Lab3: 0/1
+Lab4: 0/1
+Lab5: 0/1
+Lab6: 0/1
+Lab7: 0/1
+Lab8: 0/1
