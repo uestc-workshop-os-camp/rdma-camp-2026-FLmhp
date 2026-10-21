@@ -2,11 +2,15 @@
 
 #[allow(unused_imports)]
 use rdma_mummy_sys as verbs;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ffi::{CStr, CString};
 use std::mem::{size_of, zeroed};
 use std::ops::BitOr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 use std::{ptr, slice};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,11 +159,71 @@ struct Peer {
     qp: *mut verbs::ibv_qp,
     exported: Box<PeerExchange>,
     connected: bool,
+    inline_limit: u32,
+    send_capacity: u32,
+    inflight: u32,
+    recv_capacity: u32,
+    recv_posted: u32,
+    recv_pending: VecDeque<ReceiveEntry>,
+    recv_active: VecDeque<ReceiveEntry>,
     remotes: HashMap<RemoteMemoryId, RemoteMemory>,
 }
 
 struct Batch {
     statuses: Vec<TransferStatus>,
+    requests: Vec<Request>,
+    remaining: Vec<u32>,
+    failed: Vec<bool>,
+}
+
+#[derive(Clone, Copy)]
+struct ReceiveEntry {
+    batch: BatchId,
+    index: usize,
+    peer: PeerId,
+    address: u64,
+    length: u64,
+}
+
+struct PendingBatch {
+    batch: BatchId,
+    index: usize,
+    offset: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PostedWork {
+    index: usize,
+    slices: u32,
+}
+
+struct PostedChain {
+    batch: BatchId,
+    peer: PeerId,
+    wr_count: u32,
+    work: Vec<PostedWork>,
+}
+
+struct State {
+    cq: *mut verbs::ibv_cq,
+    locals: HashMap<MemoryId, LocalMemory>,
+    peers: HashMap<PeerId, Peer>,
+    batches: HashMap<BatchId, Batch>,
+    pending: VecDeque<PendingBatch>,
+    posted: HashMap<u64, PostedChain>,
+    next_memory: MemoryId,
+    next_peer: PeerId,
+    next_remote: RemoteMemoryId,
+    next_batch: BatchId,
+    next_chain: u64,
+}
+
+// All verbs objects are serialized by State's mutex and used until the worker joins.
+unsafe impl Send for State {}
+
+struct Shared {
+    state: Mutex<State>,
+    stop: AtomicBool,
 }
 
 pub struct Engine {
@@ -170,13 +234,8 @@ pub struct Engine {
     context: *mut verbs::ibv_context,
     pd: *mut verbs::ibv_pd,
     cq: *mut verbs::ibv_cq,
-    locals: HashMap<MemoryId, LocalMemory>,
-    peers: HashMap<PeerId, Peer>,
-    batches: HashMap<BatchId, Batch>,
-    next_memory: MemoryId,
-    next_peer: PeerId,
-    next_remote: RemoteMemoryId,
-    next_batch: BatchId,
+    shared: Arc<Shared>,
+    worker: Option<JoinHandle<()>>,
 }
 
 fn contains(base: u64, size: u64, address: u64, length: u64) -> bool {
@@ -215,8 +274,8 @@ unsafe fn open_device(name: Option<&str>) -> Result<*mut verbs::ibv_context, Err
     }
 }
 
-fn range_local(engine: &Engine, address: u64, length: u64) -> Option<&LocalMemory> {
-    engine.locals.values().find(|memory| {
+fn range_local(state: &State, address: u64, length: u64) -> Option<&LocalMemory> {
+    state.locals.values().find(|memory| {
         contains(
             memory.exported.address,
             memory.exported.length,
@@ -226,11 +285,561 @@ fn range_local(engine: &Engine, address: u64, length: u64) -> Option<&LocalMemor
     })
 }
 
+fn range_local_id(state: &State, address: u64, length: u64) -> Option<MemoryId> {
+    state.locals.iter().find_map(|(&id, memory)| {
+        contains(
+            memory.exported.address,
+            memory.exported.length,
+            address,
+            length,
+        )
+        .then_some(id)
+    })
+}
+
 fn range_remote(peer: &Peer, address: u64, length: u64) -> Option<RemoteMemory> {
     peer.remotes
         .values()
         .copied()
         .find(|memory| contains(memory.address, memory.length, address, length))
+}
+
+fn task_slices(request: Request) -> u32 {
+    match request.operation {
+        Operation::Write { .. } | Operation::Read { .. } => {
+            request.length.div_ceil(64 * 1024) as u32
+        }
+        Operation::WriteImm { .. } => request.length.div_ceil(64 * 1024).max(1) as u32,
+        Operation::Send { .. }
+        | Operation::Recv
+        | Operation::CompareSwap { .. }
+        | Operation::FetchAdd { .. } => 1,
+    }
+}
+
+fn lock_state(shared: &Shared) -> Result<MutexGuard<'_, State>, Error> {
+    shared.state.lock().map_err(|_| Error::Io)
+}
+
+fn validate_request(state: &State, request: Request) -> Result<(), Error> {
+    let peer = state.peers.get(&request.peer).ok_or(Error::Invalid)?;
+    let inline = matches!(
+        request.operation,
+        Operation::Write {
+            inline_data: true,
+            ..
+        } | Operation::Send { inline_data: true }
+            | Operation::WriteImm {
+                inline_data: true,
+                ..
+            }
+    );
+    if !matches!(request.operation, Operation::Recv) && !peer.connected {
+        return Err(Error::InvalidState);
+    }
+    if inline && request.length > peer.inline_limit as u64 {
+        return Err(Error::Unsupported);
+    }
+    if request.length == 0 {
+        return Ok(());
+    }
+    if request.local_address.is_null() {
+        return Err(Error::Invalid);
+    }
+    match request.operation {
+        Operation::CompareSwap { remote_address, .. }
+        | Operation::FetchAdd { remote_address, .. } => {
+            if request.length != 8
+                || request.local_address as u64 & 7 != 0
+                || remote_address & 7 != 0
+            {
+                return Err(Error::Invalid);
+            }
+            let local = range_local(state, request.local_address as u64, 8)
+                .filter(|memory| memory.exported.access & MemoryAccess::LOCAL_WRITE.0 != 0)
+                .ok_or(Error::Invalid)?;
+            let _ = local;
+            range_remote(peer, remote_address, 8)
+                .filter(|memory| memory.access.contains(MemoryAccess::REMOTE_ATOMIC))
+                .ok_or(Error::Invalid)?;
+        }
+        Operation::Write { remote_address, .. } | Operation::WriteImm { remote_address, .. } => {
+            if !inline && range_local(state, request.local_address as u64, request.length).is_none()
+            {
+                return Err(Error::Invalid);
+            }
+            range_remote(peer, remote_address, request.length)
+                .filter(|memory| memory.access.contains(MemoryAccess::REMOTE_WRITE))
+                .ok_or(Error::Invalid)?;
+        }
+        Operation::Read { remote_address } => {
+            range_local(state, request.local_address as u64, request.length)
+                .filter(|memory| memory.exported.access & MemoryAccess::LOCAL_WRITE.0 != 0)
+                .ok_or(Error::Invalid)?;
+            range_remote(peer, remote_address, request.length)
+                .filter(|memory| memory.access.contains(MemoryAccess::REMOTE_READ))
+                .ok_or(Error::Invalid)?;
+        }
+        Operation::Send { .. } => {
+            if request.length > u32::MAX as u64
+                || (!inline
+                    && range_local(state, request.local_address as u64, request.length).is_none())
+            {
+                return Err(Error::Invalid);
+            }
+        }
+        Operation::Recv => {
+            if request.length > u32::MAX as u64 {
+                return Err(Error::Invalid);
+            }
+            range_local(state, request.local_address as u64, request.length)
+                .filter(|memory| memory.exported.access & MemoryAccess::LOCAL_WRITE.0 != 0)
+                .ok_or(Error::Invalid)?;
+        }
+    }
+    Ok(())
+}
+
+fn fail_task(state: &mut State, batch_id: BatchId, index: usize, error: Error) {
+    if let Some(batch) = state.batches.get_mut(&batch_id) {
+        if index < batch.statuses.len() && batch.statuses[index] == TransferStatus::Pending {
+            batch.statuses[index] = TransferStatus::Failed(error);
+            batch.remaining[index] = 0;
+            batch.failed[index] = true;
+        }
+    }
+}
+
+unsafe fn post_receives(state: &mut State) {
+    let peers: Vec<_> = state.peers.keys().copied().collect();
+    for peer_id in peers {
+        loop {
+            let entry = match state.peers.get_mut(&peer_id) {
+                Some(peer) if peer.recv_posted < peer.recv_capacity => {
+                    peer.recv_pending.pop_front()
+                }
+                _ => None,
+            };
+            let Some(entry) = entry else { break };
+            let mut sge: verbs::ibv_sge = zeroed();
+            let mut wr: verbs::ibv_recv_wr = zeroed();
+            wr.wr_id = (1_u64 << 63) | (entry.batch << 32) | entry.index as u64;
+            let valid = if entry.length == 0 {
+                true
+            } else if let Some(memory) = range_local(state, entry.address, entry.length) {
+                sge.addr = entry.address;
+                sge.length = entry.length as u32;
+                sge.lkey = (*memory.mr).lkey;
+                wr.sg_list = &mut sge;
+                wr.num_sge = 1;
+                true
+            } else {
+                false
+            };
+            let peer = state.peers.get_mut(&peer_id).unwrap();
+            let mut bad = ptr::null_mut();
+            if !valid || verbs::ibv_post_recv(peer.qp, &mut wr, &mut bad) != 0 {
+                fail_task(state, entry.batch, entry.index, Error::InvalidState);
+                continue;
+            }
+            peer.recv_posted += 1;
+            peer.recv_active.push_back(entry);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WorkSpec {
+    index: usize,
+    offset: u64,
+    length: u64,
+    slices: u32,
+    final_for_task: bool,
+}
+
+fn complete_send(state: &mut State, completion: &verbs::ibv_wc) {
+    let Some(chain) = state.posted.remove(&completion.wr_id) else {
+        return;
+    };
+    if let Some(peer) = state.peers.get_mut(&chain.peer) {
+        peer.inflight = peer.inflight.saturating_sub(chain.wr_count);
+    }
+    if let Some(batch) = state.batches.get_mut(&chain.batch) {
+        for work in chain.work {
+            if work.index >= batch.statuses.len()
+                || batch.statuses[work.index] != TransferStatus::Pending
+            {
+                continue;
+            }
+            if completion.status != verbs::ibv_wc_status::IBV_WC_SUCCESS {
+                batch.failed[work.index] = true;
+            }
+            batch.remaining[work.index] = batch.remaining[work.index].saturating_sub(work.slices);
+            if batch.remaining[work.index] == 0 {
+                batch.statuses[work.index] = if batch.failed[work.index] {
+                    TransferStatus::Failed(Error::Io)
+                } else {
+                    TransferStatus::Completed { receive: None }
+                };
+            }
+        }
+    }
+}
+
+unsafe fn complete_receive(state: &mut State, completion: &verbs::ibv_wc) {
+    let batch_id = (completion.wr_id & !(1_u64 << 63)) >> 32;
+    let index = completion.wr_id as u32 as usize;
+    let mut found_peer = None;
+    for (&peer_id, peer) in &mut state.peers {
+        if let Some(position) = peer
+            .recv_active
+            .iter()
+            .position(|entry| entry.batch == batch_id && entry.index == index)
+        {
+            peer.recv_active.remove(position);
+            peer.recv_posted = peer.recv_posted.saturating_sub(1);
+            found_peer = Some(peer_id);
+            break;
+        }
+    }
+    if found_peer.is_none() {
+        return;
+    }
+    let Some(batch) = state.batches.get_mut(&batch_id) else {
+        return;
+    };
+    if index >= batch.statuses.len() || batch.statuses[index] != TransferStatus::Pending {
+        return;
+    }
+    batch.remaining[index] = 0;
+    batch.statuses[index] = if completion.status != verbs::ibv_wc_status::IBV_WC_SUCCESS {
+        TransferStatus::Failed(Error::Io)
+    } else if completion.opcode == verbs::ibv_wc_opcode::IBV_WC_RECV_RDMA_WITH_IMM {
+        TransferStatus::Completed {
+            receive: Some(ReceiveResult::WriteNotice {
+                immediate: u32::from_be(completion.imm_data_invalidated_rkey_union.imm_data),
+            }),
+        }
+    } else {
+        TransferStatus::Completed {
+            receive: Some(ReceiveResult::Message {
+                length: completion.byte_len as u64,
+            }),
+        }
+    };
+}
+
+unsafe fn post_one_chain(state: &mut State) -> bool {
+    let Some(mut pending) = state.pending.pop_front() else {
+        return false;
+    };
+    loop {
+        let Some(batch) = state.batches.get(&pending.batch) else {
+            return true;
+        };
+        if pending.index >= batch.requests.len() {
+            return true;
+        }
+        if batch.statuses[pending.index] != TransferStatus::Pending {
+            pending.index += 1;
+            pending.offset = 0;
+            continue;
+        }
+        let request = batch.requests[pending.index];
+        if matches!(request.operation, Operation::Recv) {
+            let entry = ReceiveEntry {
+                batch: pending.batch,
+                index: pending.index,
+                peer: request.peer,
+                address: request.local_address as u64,
+                length: request.length,
+            };
+            if let Some(peer) = state.peers.get_mut(&request.peer) {
+                peer.recv_pending.push_back(entry);
+            } else {
+                fail_task(state, pending.batch, pending.index, Error::Canceled);
+            }
+            pending.index += 1;
+            pending.offset = 0;
+            continue;
+        }
+        break;
+    }
+
+    let first_request = state.batches[&pending.batch].requests[pending.index];
+    let Some(peer) = state.peers.get(&first_request.peer) else {
+        fail_task(state, pending.batch, pending.index, Error::Canceled);
+        pending.index += 1;
+        state.pending.push_back(pending);
+        return true;
+    };
+    if !peer.connected {
+        fail_task(state, pending.batch, pending.index, Error::InvalidState);
+        pending.index += 1;
+        state.pending.push_back(pending);
+        return true;
+    }
+    let capacity = (peer.send_capacity - peer.inflight).min(16) as usize;
+    if capacity == 0 {
+        state.pending.push_back(pending);
+        return false;
+    }
+    let peer_id = first_request.peer;
+    let mut next_index = pending.index;
+    let mut next_offset = pending.offset;
+    let mut specs = Vec::with_capacity(capacity);
+    while specs.len() < capacity {
+        let batch = &state.batches[&pending.batch];
+        if next_index >= batch.requests.len() {
+            break;
+        }
+        if batch.statuses[next_index] != TransferStatus::Pending {
+            next_index += 1;
+            next_offset = 0;
+            continue;
+        }
+        let request = batch.requests[next_index];
+        if request.peer != peer_id || matches!(request.operation, Operation::Recv) {
+            break;
+        }
+        let max_length = 16 * 64 * 1024;
+        let remaining = request.length.saturating_sub(next_offset);
+        let length = remaining.min(max_length);
+        let slices = if length == 0 {
+            1
+        } else {
+            length.div_ceil(64 * 1024) as u32
+        };
+        let final_for_task = next_offset + length >= request.length;
+        specs.push(WorkSpec {
+            index: next_index,
+            offset: next_offset,
+            length,
+            slices,
+            final_for_task,
+        });
+        if final_for_task {
+            next_index += 1;
+            next_offset = 0;
+        } else {
+            next_offset += length;
+        }
+    }
+    if specs.is_empty() {
+        state.pending.push_back(pending);
+        return false;
+    }
+
+    state.next_chain = match state.next_chain.checked_add(1) {
+        Some(id) => id,
+        None => {
+            fail_task(state, pending.batch, pending.index, Error::NoMemory);
+            return true;
+        }
+    };
+    let chain_id = state.next_chain;
+    let batch = &state.batches[&pending.batch];
+    let mut wrs: Vec<verbs::ibv_send_wr> = (0..specs.len()).map(|_| zeroed()).collect();
+    let sge_count: usize = specs.iter().map(|spec| spec.slices as usize).sum();
+    let mut sges: Vec<verbs::ibv_sge> = (0..sge_count).map(|_| zeroed()).collect();
+    let mut sge_index = 0;
+    for (wr_index, spec) in specs.iter().enumerate() {
+        let request = batch.requests[spec.index];
+        let peer = &state.peers[&peer_id];
+        let inline = matches!(
+            request.operation,
+            Operation::Write {
+                inline_data: true,
+                ..
+            } | Operation::Send { inline_data: true }
+                | Operation::WriteImm {
+                    inline_data: true,
+                    ..
+                }
+        );
+        let lkey = if inline || spec.length == 0 {
+            0
+        } else {
+            (*range_local(
+                state,
+                request.local_address as u64 + spec.offset,
+                spec.length,
+            )
+            .unwrap()
+            .mr)
+                .lkey
+        };
+        let first_sge = sge_index;
+        let mut described = 0;
+        while described < spec.length {
+            let length = (spec.length - described).min(64 * 1024);
+            sges[sge_index] = verbs::ibv_sge {
+                addr: request.local_address as u64 + spec.offset + described,
+                length: length as u32,
+                lkey,
+            };
+            sge_index += 1;
+            described += length;
+        }
+        let wr = &mut wrs[wr_index];
+        wr.wr_id = chain_id;
+        if spec.length != 0 {
+            wr.sg_list = sges.as_mut_ptr().add(first_sge);
+            wr.num_sge = (sge_index - first_sge) as i32;
+        }
+        if inline {
+            wr.send_flags |= verbs::ibv_send_flags::IBV_SEND_INLINE.0;
+        }
+        match request.operation {
+            Operation::Write { remote_address, .. } => {
+                let remote = range_remote(peer, remote_address + spec.offset, spec.length).unwrap();
+                wr.opcode = verbs::ibv_wr_opcode::IBV_WR_RDMA_WRITE;
+                wr.wr = verbs::wr_t {
+                    rdma: verbs::rdma_t {
+                        remote_addr: remote_address + spec.offset,
+                        rkey: remote.rkey,
+                    },
+                };
+            }
+            Operation::Read { remote_address } => {
+                let remote = range_remote(peer, remote_address + spec.offset, spec.length).unwrap();
+                wr.opcode = verbs::ibv_wr_opcode::IBV_WR_RDMA_READ;
+                wr.wr = verbs::wr_t {
+                    rdma: verbs::rdma_t {
+                        remote_addr: remote_address + spec.offset,
+                        rkey: remote.rkey,
+                    },
+                };
+            }
+            Operation::Send { .. } => wr.opcode = verbs::ibv_wr_opcode::IBV_WR_SEND,
+            Operation::WriteImm {
+                remote_address,
+                immediate,
+                ..
+            } => {
+                let rkey = if spec.length == 0 {
+                    0
+                } else {
+                    range_remote(peer, remote_address + spec.offset, spec.length)
+                        .unwrap()
+                        .rkey
+                };
+                wr.opcode = if spec.final_for_task {
+                    verbs::ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM
+                } else {
+                    verbs::ibv_wr_opcode::IBV_WR_RDMA_WRITE
+                };
+                if spec.final_for_task {
+                    wr.imm_data_invalidated_rkey_union = verbs::imm_data_invalidated_rkey_union_t {
+                        imm_data: immediate.to_be(),
+                    };
+                }
+                wr.wr = verbs::wr_t {
+                    rdma: verbs::rdma_t {
+                        remote_addr: remote_address + spec.offset,
+                        rkey,
+                    },
+                };
+            }
+            Operation::CompareSwap {
+                remote_address,
+                compare,
+                value,
+            } => {
+                let remote = range_remote(peer, remote_address, 8).unwrap();
+                wr.opcode = verbs::ibv_wr_opcode::IBV_WR_ATOMIC_CMP_AND_SWP;
+                wr.wr = verbs::wr_t {
+                    atomic: verbs::atomic_t {
+                        remote_addr: remote_address,
+                        compare_add: compare,
+                        swap: value,
+                        rkey: remote.rkey,
+                    },
+                };
+            }
+            Operation::FetchAdd {
+                remote_address,
+                value,
+            } => {
+                let remote = range_remote(peer, remote_address, 8).unwrap();
+                wr.opcode = verbs::ibv_wr_opcode::IBV_WR_ATOMIC_FETCH_AND_ADD;
+                wr.wr = verbs::wr_t {
+                    atomic: verbs::atomic_t {
+                        remote_addr: remote_address,
+                        compare_add: value,
+                        swap: 0,
+                        rkey: remote.rkey,
+                    },
+                };
+            }
+            Operation::Recv => unreachable!(),
+        }
+    }
+    for index in 0..wrs.len() - 1 {
+        wrs[index].next = &mut wrs[index + 1];
+    }
+    wrs.last_mut().unwrap().send_flags |= verbs::ibv_send_flags::IBV_SEND_SIGNALED.0;
+    let mut bad = ptr::null_mut();
+    let qp = state.peers[&peer_id].qp;
+    if verbs::ibv_post_send(qp, wrs.as_mut_ptr(), &mut bad) != 0 {
+        for spec in &specs {
+            fail_task(state, pending.batch, spec.index, Error::Io);
+        }
+    } else {
+        state.peers.get_mut(&peer_id).unwrap().inflight += specs.len() as u32;
+        state.posted.insert(
+            chain_id,
+            PostedChain {
+                batch: pending.batch,
+                peer: peer_id,
+                wr_count: specs.len() as u32,
+                work: specs
+                    .iter()
+                    .map(|spec| PostedWork {
+                        index: spec.index,
+                        slices: spec.slices,
+                    })
+                    .collect(),
+            },
+        );
+    }
+    pending.index = next_index;
+    pending.offset = next_offset;
+    if pending.index < state.batches[&pending.batch].requests.len() {
+        state.pending.push_back(pending);
+    }
+    true
+}
+
+fn worker_main(shared: Arc<Shared>) {
+    while !shared.stop.load(Ordering::Acquire) {
+        if let Ok(mut state) = shared.state.lock() {
+            unsafe {
+                post_receives(&mut state);
+                for _ in 0..state.pending.len().max(1) {
+                    if !post_one_chain(&mut state) {
+                        break;
+                    }
+                }
+                let mut completions: [verbs::ibv_wc; 16] = zeroed();
+                let count = verbs::ibv_poll_cq(
+                    state.cq,
+                    completions.len() as i32,
+                    completions.as_mut_ptr(),
+                );
+                if count > 0 {
+                    for completion in &completions[..count as usize] {
+                        if completion.wr_id & (1_u64 << 63) != 0 {
+                            complete_receive(&mut state, completion);
+                        } else {
+                            complete_send(&mut state, completion);
+                        }
+                    }
+                }
+            }
+        }
+        thread::sleep(Duration::from_micros(50));
+    }
 }
 
 impl Engine {
@@ -267,6 +876,35 @@ impl Engine {
                 verbs::ibv_close_device(context);
                 return Err(Error::Io);
             }
+            let shared = Arc::new(Shared {
+                state: Mutex::new(State {
+                    cq,
+                    locals: HashMap::new(),
+                    peers: HashMap::new(),
+                    batches: HashMap::new(),
+                    pending: VecDeque::new(),
+                    posted: HashMap::new(),
+                    next_memory: 0,
+                    next_peer: 0,
+                    next_remote: 0,
+                    next_batch: 0,
+                    next_chain: 0,
+                }),
+                stop: AtomicBool::new(false),
+            });
+            let worker_shared = Arc::clone(&shared);
+            let worker = match thread::Builder::new()
+                .name("rdma101-progress".into())
+                .spawn(move || worker_main(worker_shared))
+            {
+                Ok(worker) => worker,
+                Err(_) => {
+                    verbs::ibv_destroy_cq(cq);
+                    verbs::ibv_dealloc_pd(pd);
+                    verbs::ibv_close_device(context);
+                    return Err(Error::NoMemory);
+                }
+            };
             Ok(Box::new(Self {
                 port,
                 gid_index,
@@ -275,13 +913,8 @@ impl Engine {
                 context,
                 pd,
                 cq,
-                locals: HashMap::new(),
-                peers: HashMap::new(),
-                batches: HashMap::new(),
-                next_memory: 0,
-                next_peer: 0,
-                next_remote: 0,
-                next_batch: 0,
+                shared,
+                worker: Some(worker),
             }))
         }
     }
@@ -309,11 +942,18 @@ impl Engine {
         if mr.is_null() {
             return Err(Error::NoMemory);
         }
-        self.next_memory = self.next_memory.checked_add(1).ok_or_else(|| {
+        let mut state = match lock_state(&self.shared) {
+            Ok(state) => state,
+            Err(error) => {
+                verbs::ibv_dereg_mr(mr);
+                return Err(error);
+            }
+        };
+        state.next_memory = state.next_memory.checked_add(1).ok_or_else(|| {
             verbs::ibv_dereg_mr(mr);
             Error::NoMemory
         })?;
-        let id = self.next_memory;
+        let id = state.next_memory;
         let exported = Box::new(MemoryExchange {
             address: address as u64,
             length: length as u64,
@@ -321,7 +961,8 @@ impl Engine {
             access: access.0,
         });
         let metadata = (&*exported as *const MemoryExchange).cast::<u8>();
-        self.locals.insert(id, LocalMemory { mr, exported });
+        state.locals.insert(id, LocalMemory { mr, exported });
+        drop(state);
         Ok(MemoryMetadata {
             memory: id,
             metadata: slice::from_raw_parts(metadata, size_of::<MemoryExchange>()),
@@ -335,9 +976,39 @@ impl Engine {
     /// # Safety
     /// The application has stopped and drained all remote accesses to this MR.
     pub unsafe fn deregister_local_memory(&mut self, memory: MemoryId) -> Result<(), Error> {
-        let local = self.locals.remove(&memory).ok_or(Error::Invalid)?;
+        let mut state = lock_state(&self.shared)?;
+        let local = state.locals.get(&memory).ok_or(Error::Invalid)?;
+        let busy = state.batches.values().any(|batch| {
+            batch.requests.iter().enumerate().any(|(index, request)| {
+                if batch.statuses[index] != TransferStatus::Pending || request.length == 0 {
+                    return false;
+                }
+                let inline = matches!(
+                    request.operation,
+                    Operation::Write {
+                        inline_data: true,
+                        ..
+                    } | Operation::Send { inline_data: true }
+                        | Operation::WriteImm {
+                            inline_data: true,
+                            ..
+                        }
+                );
+                !inline
+                    && contains(
+                        local.exported.address,
+                        local.exported.length,
+                        request.local_address as u64,
+                        request.length,
+                    )
+            })
+        });
+        if busy {
+            return Err(Error::Busy);
+        }
+        let local = state.locals.remove(&memory).unwrap();
         if verbs::ibv_dereg_mr(local.mr) != 0 {
-            self.locals.insert(memory, local);
+            state.locals.insert(memory, local);
             return Err(Error::Io);
         }
         Ok(())
@@ -358,11 +1029,12 @@ impl Engine {
         if info.length == 0 || info.address.checked_add(info.length).is_none() {
             return Err(Error::Invalid);
         }
-        let peer = self.peers.get_mut(&peer).ok_or(Error::Invalid)?;
-        if !peer.connected {
+        let mut state = lock_state(&self.shared)?;
+        let local_peer = state.peers.get(&peer).ok_or(Error::Invalid)?;
+        if !local_peer.connected {
             return Err(Error::InvalidState);
         }
-        for remote in peer.remotes.values() {
+        for remote in local_peer.remotes.values() {
             if remote.address == info.address
                 && remote.length == info.length
                 && remote.rkey == info.rkey
@@ -378,9 +1050,9 @@ impl Engine {
                 return Err(Error::Invalid);
             }
         }
-        self.next_remote = self.next_remote.checked_add(1).ok_or(Error::NoMemory)?;
-        let id = self.next_remote;
-        peer.remotes.insert(
+        state.next_remote = state.next_remote.checked_add(1).ok_or(Error::NoMemory)?;
+        let id = state.next_remote;
+        state.peers.get_mut(&peer).unwrap().remotes.insert(
             id,
             RemoteMemory {
                 id,
@@ -396,12 +1068,42 @@ impl Engine {
     /// Remove a local imported descriptor; return Busy while an accepted task uses it.
     /// The peer's MR and its other connections remain unchanged.
     pub fn remove_remote_memory(&mut self, memory: RemoteMemoryId) -> Result<(), Error> {
-        for peer in self.peers.values_mut() {
-            if peer.remotes.remove(&memory).is_some() {
-                return Ok(());
-            }
+        let mut state = lock_state(&self.shared)?;
+        let Some((peer_id, remote)) = state.peers.iter().find_map(|(&peer_id, peer)| {
+            peer.remotes
+                .get(&memory)
+                .copied()
+                .map(|remote| (peer_id, remote))
+        }) else {
+            return Err(Error::Invalid);
+        };
+        let busy = state.batches.values().any(|batch| {
+            batch.requests.iter().enumerate().any(|(index, request)| {
+                if batch.statuses[index] != TransferStatus::Pending || request.peer != peer_id {
+                    return false;
+                }
+                let address = match request.operation {
+                    Operation::Write { remote_address, .. }
+                    | Operation::Read { remote_address }
+                    | Operation::WriteImm { remote_address, .. }
+                    | Operation::CompareSwap { remote_address, .. }
+                    | Operation::FetchAdd { remote_address, .. } => remote_address,
+                    Operation::Send { .. } | Operation::Recv => return false,
+                };
+                request.length != 0
+                    && contains(remote.address, remote.length, address, request.length)
+            })
+        });
+        if busy {
+            return Err(Error::Busy);
         }
-        Err(Error::Invalid)
+        state
+            .peers
+            .get_mut(&peer_id)
+            .unwrap()
+            .remotes
+            .remove(&memory);
+        Ok(())
     }
 
     /// Create a local peer and export its connection metadata.
@@ -440,13 +1142,26 @@ impl Engine {
                 verbs::ibv_destroy_qp(qp);
                 return Err(Error::Io);
             }
-            self.next_peer = self.next_peer.checked_add(1).ok_or(Error::NoMemory)?;
-            let id = self.next_peer;
             let mut gid: verbs::ibv_gid = zeroed();
             if verbs::ibv_query_gid(self.context, self.port, self.gid_index, &mut gid) != 0 {
                 verbs::ibv_destroy_qp(qp);
                 return Err(Error::Io);
             }
+            let mut state = match lock_state(&self.shared) {
+                Ok(state) => state,
+                Err(error) => {
+                    verbs::ibv_destroy_qp(qp);
+                    return Err(error);
+                }
+            };
+            state.next_peer = match state.next_peer.checked_add(1) {
+                Some(id) => id,
+                None => {
+                    verbs::ibv_destroy_qp(qp);
+                    return Err(Error::NoMemory);
+                }
+            };
+            let id = state.next_peer;
             let exported = Box::new(PeerExchange {
                 lid: self.lid,
                 qpn: (*qp).qp_num,
@@ -454,15 +1169,23 @@ impl Engine {
                 gid,
             });
             let metadata = (&*exported as *const PeerExchange).cast::<u8>();
-            self.peers.insert(
+            state.peers.insert(
                 id,
                 Peer {
                     qp,
                     exported,
                     connected: false,
+                    inline_limit: init.cap.max_inline_data,
+                    send_capacity: init.cap.max_send_wr,
+                    inflight: 0,
+                    recv_capacity: init.cap.max_recv_wr,
+                    recv_posted: 0,
+                    recv_pending: VecDeque::new(),
+                    recv_active: VecDeque::new(),
                     remotes: HashMap::new(),
                 },
             );
+            drop(state);
             Ok(PeerMetadata {
                 peer: id,
                 metadata: slice::from_raw_parts(metadata, size_of::<PeerExchange>()),
@@ -477,7 +1200,8 @@ impl Engine {
             return Err(Error::Invalid);
         }
         let remote = unsafe { ptr::read_unaligned(metadata.as_ptr().cast::<PeerExchange>()) };
-        let local = self.peers.get_mut(&peer).ok_or(Error::Invalid)?;
+        let mut state = lock_state(&self.shared)?;
+        let local = state.peers.get_mut(&peer).ok_or(Error::Invalid)?;
         if local.connected {
             return Err(Error::InvalidState);
         }
@@ -538,10 +1262,25 @@ impl Engine {
     /// On cleanup failure keep the handle for retry, but reject further use.
     /// Also handle INIT and failed setup.
     pub fn destroy_peer(&mut self, peer: PeerId) -> Result<(), Error> {
-        let peer = self.peers.remove(&peer).ok_or(Error::Invalid)?;
-        if unsafe { verbs::ibv_destroy_qp(peer.qp) } != 0 {
+        let mut state = lock_state(&self.shared)?;
+        let qp = state.peers.get_mut(&peer).ok_or(Error::Invalid)?.qp;
+        state.peers.get_mut(&peer).unwrap().connected = false;
+        for batch in state.batches.values_mut() {
+            for index in 0..batch.requests.len() {
+                if batch.requests[index].peer == peer
+                    && batch.statuses[index] == TransferStatus::Pending
+                {
+                    batch.statuses[index] = TransferStatus::Failed(Error::Canceled);
+                    batch.remaining[index] = 0;
+                    batch.failed[index] = true;
+                }
+            }
+        }
+        state.posted.retain(|_, chain| chain.peer != peer);
+        if unsafe { verbs::ibv_destroy_qp(qp) } != 0 {
             return Err(Error::Io);
         }
+        state.peers.remove(&peer);
         Ok(())
     }
 
@@ -556,104 +1295,42 @@ impl Engine {
         if requests.is_empty() {
             return Err(Error::Invalid);
         }
-        for request in &requests {
-            let peer = self.peers.get(&request.peer).ok_or(Error::Invalid)?;
-            if !peer.connected {
-                return Err(Error::InvalidState);
-            }
-            let (remote_address, inline_data) = match request.operation {
-                Operation::Write {
-                    remote_address,
-                    inline_data,
-                } => (remote_address, inline_data),
-                _ => return Err(Error::Unsupported),
-            };
-            if request.length > u32::MAX as u64 {
-                return Err(Error::Invalid);
-            }
-            let remote =
-                range_remote(peer, remote_address, request.length).ok_or(Error::Invalid)?;
-            if !remote.access.contains(MemoryAccess::REMOTE_WRITE) {
-                return Err(Error::Invalid);
-            }
-            if inline_data {
-                if request.length > 256 || (request.length != 0 && request.local_address.is_null())
-                {
-                    return Err(Error::Invalid);
-                }
-            } else if range_local(self, request.local_address as u64, request.length).is_none() {
-                return Err(Error::Invalid);
-            }
+        let mut state = lock_state(&self.shared)?;
+        for &request in &requests {
+            validate_request(&state, request)?;
         }
-
-        self.next_batch = self.next_batch.checked_add(1).ok_or(Error::NoMemory)?;
-        let batch_id = self.next_batch;
+        state.next_batch = state.next_batch.checked_add(1).ok_or(Error::NoMemory)?;
+        let batch_id = state.next_batch;
         let mut statuses = vec![TransferStatus::Pending; requests.len()];
-        for (index, request) in requests.iter().enumerate() {
-            if request.length == 0 {
+        let mut remaining = Vec::with_capacity(requests.len());
+        for (index, &request) in requests.iter().enumerate() {
+            if request.length == 0
+                && !matches!(
+                    request.operation,
+                    Operation::Recv | Operation::Send { .. } | Operation::WriteImm { .. }
+                )
+            {
                 statuses[index] = TransferStatus::Completed { receive: None };
-                continue;
-            }
-            let peer = self.peers.get(&request.peer).unwrap();
-            let (remote_address, inline_data) = match request.operation {
-                Operation::Write {
-                    remote_address,
-                    inline_data,
-                } => (remote_address, inline_data),
-                _ => unreachable!(),
-            };
-            let remote = range_remote(peer, remote_address, request.length).unwrap();
-            let mut sge = verbs::ibv_sge {
-                addr: request.local_address as u64,
-                length: request.length as u32,
-                lkey: if inline_data {
-                    0
-                } else {
-                    (*range_local(self, request.local_address as u64, request.length)
-                        .unwrap()
-                        .mr)
-                        .lkey
-                },
-            };
-            let mut wr: verbs::ibv_send_wr = zeroed();
-            wr.wr_id = index as u64 + 1;
-            wr.sg_list = &mut sge;
-            wr.num_sge = 1;
-            wr.opcode = verbs::ibv_wr_opcode::IBV_WR_RDMA_WRITE;
-            wr.send_flags = verbs::ibv_send_flags::IBV_SEND_SIGNALED.0;
-            if inline_data {
-                wr.send_flags |= verbs::ibv_send_flags::IBV_SEND_INLINE.0;
-            }
-            wr.wr = verbs::wr_t {
-                rdma: verbs::rdma_t {
-                    remote_addr: remote_address,
-                    rkey: remote.rkey,
-                },
-            };
-            let mut bad = ptr::null_mut();
-            if verbs::ibv_post_send(peer.qp, &mut wr, &mut bad) != 0 {
-                statuses[index] = TransferStatus::Failed(Error::Io);
-                continue;
-            }
-            let mut completion: verbs::ibv_wc = zeroed();
-            loop {
-                let count = verbs::ibv_poll_cq(self.cq, 1, &mut completion);
-                if count < 0 {
-                    statuses[index] = TransferStatus::Failed(Error::Io);
-                    break;
-                }
-                if count == 1 {
-                    statuses[index] = if completion.status == verbs::ibv_wc_status::IBV_WC_SUCCESS {
-                        TransferStatus::Completed { receive: None }
-                    } else {
-                        TransferStatus::Failed(Error::Io)
-                    };
-                    break;
-                }
-                std::thread::yield_now();
+                remaining.push(0);
+            } else {
+                remaining.push(task_slices(request));
             }
         }
-        self.batches.insert(batch_id, Batch { statuses });
+        let count = requests.len();
+        state.batches.insert(
+            batch_id,
+            Batch {
+                statuses,
+                requests,
+                remaining,
+                failed: vec![false; count],
+            },
+        );
+        state.pending.push_back(PendingBatch {
+            batch: batch_id,
+            index: 0,
+            offset: 0,
+        });
         Ok(batch_id)
     }
 
@@ -665,25 +1342,23 @@ impl Engine {
         batch: BatchId,
         statuses: &mut [TransferStatus],
     ) -> Result<(), Error> {
-        let batch = self.batches.get(&batch).ok_or(Error::Invalid)?;
-        if statuses.len() != batch.statuses.len() {
+        let state = lock_state(&self.shared)?;
+        let record = state.batches.get(&batch).ok_or(Error::Invalid)?;
+        if statuses.len() != record.statuses.len() {
             return Err(Error::Invalid);
         }
-        statuses.copy_from_slice(&batch.statuses);
+        statuses.copy_from_slice(&record.statuses);
         Ok(())
     }
 
     /// Release the batch's task records. Return Busy while any task is Pending.
     pub fn free_batch(&mut self, batch: BatchId) -> Result<(), Error> {
-        let record = self.batches.get(&batch).ok_or(Error::Invalid)?;
-        if record
-            .statuses
-            .iter()
-            .any(|status| *status == TransferStatus::Pending)
-        {
+        let mut state = lock_state(&self.shared)?;
+        let record = state.batches.get(&batch).ok_or(Error::Invalid)?;
+        if record.statuses.contains(&TransferStatus::Pending) {
             return Err(Error::Busy);
         }
-        self.batches.remove(&batch);
+        state.batches.remove(&batch);
         Ok(())
     }
 }
@@ -692,12 +1367,18 @@ impl Drop for Engine {
     /// Release the engine's resources after stopping worker and device accesses.
     /// Cleanup must also handle partial initialization and unmatched receives.
     fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
         unsafe {
-            for (_, peer) in self.peers.drain() {
-                verbs::ibv_destroy_qp(peer.qp);
-            }
-            for (_, memory) in self.locals.drain() {
-                verbs::ibv_dereg_mr(memory.mr);
+            if let Ok(mut state) = self.shared.state.lock() {
+                for (_, peer) in state.peers.drain() {
+                    verbs::ibv_destroy_qp(peer.qp);
+                }
+                for (_, memory) in state.locals.drain() {
+                    verbs::ibv_dereg_mr(memory.mr);
+                }
             }
             verbs::ibv_destroy_cq(self.cq);
             verbs::ibv_dealloc_pd(self.pd);
