@@ -340,7 +340,12 @@ fn validate_request(state: &State, request: Request) -> Result<(), Error> {
     if inline && request.length > peer.inline_limit as u64 {
         return Err(Error::Unsupported);
     }
-    if request.length == 0 {
+    if request.length == 0
+        && !matches!(
+            request.operation,
+            Operation::CompareSwap { .. } | Operation::FetchAdd { .. }
+        )
+    {
         return Ok(());
     }
     if request.local_address.is_null() {
